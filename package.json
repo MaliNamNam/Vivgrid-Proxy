@@ -1,0 +1,13 @@
+{
+  "name": "vivgrid-proxy",
+  "version": "1.0.0",
+  "description": "A simple Bun-based proxy that rotates through multiple Vivgrid API keys",
+  "type": "module",
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun run --watch index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.0.0"
+  }
+}

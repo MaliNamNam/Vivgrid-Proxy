@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Bun
+bun.lockb
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# API Keys & Configuration (sensitive)
+keys.json
+settings.json
+
+# AI Agent files
+AGENTS.md
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build output
+dist/
+build/
+out/
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
