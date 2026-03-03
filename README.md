@@ -120,13 +120,35 @@ Update your application to use the proxy instead of the Vivgrid API directly.
 {
   "provider": {
     "vivgrid-anth": {
+      "npm": "@ai-sdk/anthropic",
+      "name": "vivgrid(anthropic)",
       "options": {
-        "baseURL": "http://localhost:3456/v1"
+        "baseURL": "http://localhost:3456/v1",
+        "apiKey": "proxy-managed",
+        "timeout": 300000
+      },
+      "models": {
+        "claude-opus-4.5": {
+          "id": "claude-opus-4-5",
+          "name": "Claude Opus 4.5 Thinking",
+          "limit": {
+            "context": 200000,
+            "output": 16000
+          },
+          "reasoning": true,
+          "interleaved": true,
+          "modalities": {
+            "input": ["image", "text"],
+            "output": ["text"]
+          }
+        }
       }
     }
   }
 }
 ```
+
+> **Note:** The `apiKey` can be any placeholder value (e.g., `"proxy-managed"`) since the proxy injects the real API key automatically.
 
 **Example for other applications:**
 ```bash
