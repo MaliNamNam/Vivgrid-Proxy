@@ -25,4 +25,6 @@ export interface KeyStats {
   lastUsed: number
   rateLimited: boolean
   rateLimitResetAt?: number
+  rateLimitCount?: number
+  lastRateLimitedAt?: number
 }

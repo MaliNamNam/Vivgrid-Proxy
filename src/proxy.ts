@@ -83,6 +83,67 @@ function isSSEResponse(response: Response): boolean {
   return contentType.includes("text/event-stream")
 }
 
+const DEFAULT_RATE_LIMIT_WAIT_MS = 1000
+const MAX_RATE_LIMIT_WAIT_MS = 30000
+
+interface KeySelection {
+  key: string
+  index: number
+  reason: "balanced" | "sticky-current" | "sticky-fallback" | "sticky-probe"
+}
+
+function parseRetryAfterMs(retryAfter?: string) {
+  if (!retryAfter) {
+    return null
+  }
+
+  const seconds = Number(retryAfter)
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, Math.ceil(seconds * 1000))
+  }
+
+  const timestamp = Date.parse(retryAfter)
+  if (!Number.isNaN(timestamp)) {
+    return Math.max(0, timestamp - Date.now())
+  }
+
+  return null
+}
+
+function createProxyResponse(
+  response: Response,
+  requestId: number,
+  keyIndex: number,
+  rotationMode: Settings["rotationMode"]
+) {
+  const responseHeaders = new Headers(response.headers)
+  responseHeaders.set("x-proxy-key-index", String(keyIndex))
+  responseHeaders.set("x-proxy-rotation-mode", rotationMode)
+
+  let responseBody = response.body
+  if (isSSEResponse(response) && responseBody) {
+    verboseLog(`Request #${requestId} response is SSE, enabling event buffer transform`)
+    responseBody = responseBody.pipeThrough(createSSEBufferTransform(requestId))
+  } else if (isSSEResponse(response)) {
+    verboseLog(`Request #${requestId} response marked as SSE but has no body`)
+  }
+
+  verboseLog(`Request #${requestId} returning response`, {
+    status: response.status,
+    statusText: response.statusText,
+    proxyHeaders: {
+      "x-proxy-key-index": String(keyIndex),
+      "x-proxy-rotation-mode": rotationMode,
+    },
+  })
+
+  return new Response(responseBody, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders,
+  })
+}
+
 // ============================================
 // Proxy Server
 // ============================================
@@ -96,6 +157,7 @@ export function runProxy(config: Config, settings: Settings) {
   const keys = config.keys.map(k => k.key)
   let currentKeyIndex = 0
   let requestCounter = 0
+  const stickyProbeQueue: number[] = []
   
   const keyStats = new Map<string, KeyStats>()
   keys.forEach(key => {
@@ -104,6 +166,7 @@ export function runProxy(config: Config, settings: Settings) {
       errors: 0,
       lastUsed: 0,
       rateLimited: false,
+      rateLimitCount: 0,
     })
   })
 
@@ -117,19 +180,83 @@ export function runProxy(config: Config, settings: Settings) {
       prefix: maskKey(entry.key),
     })),
   })
+
+  function removeStickyProbe(index: number) {
+    const queueIndex = stickyProbeQueue.indexOf(index)
+    if (queueIndex !== -1) {
+      stickyProbeQueue.splice(queueIndex, 1)
+    }
+  }
+
+  function enqueueStickyProbe(index: number) {
+    removeStickyProbe(index)
+    stickyProbeQueue.push(index)
+  }
+
+  function clearExpiredRateLimit(index: number, now: number, context: string) {
+    const key = keys[index]
+    const stats = keyStats.get(key)!
+
+    if (!stats.rateLimited || !stats.rateLimitResetAt || now < stats.rateLimitResetAt) {
+      return false
+    }
+
+    stats.rateLimited = false
+    stats.rateLimitResetAt = undefined
+
+    verboseLog(context, {
+      keyIndex: index + 1,
+      key: maskKey(key),
+      queuedForProbe: stickyProbeQueue.includes(index),
+    })
+
+    return true
+  }
+
+  function recordSelection(index: number, now: number) {
+    const key = keys[index]
+    const stats = keyStats.get(key)!
+    stats.requests++
+    stats.lastUsed = now
+  }
+
+  function getStickyProbeCandidate(now: number, excludedIndices: Set<number>) {
+    for (let i = stickyProbeQueue.length - 1; i >= 0; i--) {
+      const index = stickyProbeQueue[i]
+      if (excludedIndices.has(index)) {
+        continue
+      }
+
+      clearExpiredRateLimit(index, now, "Sticky probe became eligible again")
+
+      const stats = keyStats.get(keys[index])!
+      if (!stats.rateLimited) {
+        return index
+      }
+    }
+
+    return null
+  }
   
-  function getKeyBalanced(): string {
+  function getKeyBalanced(excludedIndices: Set<number>): KeySelection | null {
     const now = Date.now()
 
     verboseLog("Selecting key using balanced mode", {
       startingIndex: currentKeyIndex + 1,
+      excludedIndices: Array.from(excludedIndices, index => index + 1),
     })
     
     // Round-robin: try each key starting from currentKeyIndex
     for (let i = 0; i < keys.length; i++) {
       const candidateIndex = (currentKeyIndex + i) % keys.length
+      if (excludedIndices.has(candidateIndex)) {
+        continue
+      }
+
       const key = keys[candidateIndex]
       const stats = keyStats.get(key)!
+
+      clearExpiredRateLimit(candidateIndex, now, "Cleared expired rate limit for balanced candidate")
 
       verboseLog("Balanced candidate", {
         keyIndex: candidateIndex + 1,
@@ -140,20 +267,9 @@ export function runProxy(config: Config, settings: Settings) {
         errors: stats.errors,
       })
       
-      // Clear rate limit if reset time has passed
-      if (stats.rateLimited && stats.rateLimitResetAt && now > stats.rateLimitResetAt) {
-        stats.rateLimited = false
-
-        verboseLog("Cleared expired rate limit for key", {
-          keyIndex: candidateIndex + 1,
-          key: maskKey(key),
-        })
-      }
-      
       if (!stats.rateLimited) {
         currentKeyIndex = (currentKeyIndex + i + 1) % keys.length
-        stats.requests++
-        stats.lastUsed = now
+        recordSelection(candidateIndex, now)
 
         verboseLog("Balanced key selected", {
           selectedIndex: candidateIndex + 1,
@@ -162,18 +278,42 @@ export function runProxy(config: Config, settings: Settings) {
           totalRequestsForKey: stats.requests,
         })
 
-        return key
+        return {
+          key,
+          index: candidateIndex,
+          reason: "balanced",
+        }
       }
     }
-    
-    // All keys rate-limited, pick the one with earliest reset
-    verboseLog("All keys are rate-limited in balanced mode; selecting earliest reset key")
-    return getKeyWithEarliestReset()
+
+    verboseLog("All keys are cooling down in balanced mode")
+    return null
   }
   
-  function getKeySticky(): string {
+  function getKeySticky(excludedIndices: Set<number>): KeySelection | null {
     const now = Date.now()
-    
+
+    const probeIndex = getStickyProbeCandidate(now, excludedIndices)
+    if (probeIndex !== null) {
+      const key = keys[probeIndex]
+      const stats = keyStats.get(key)!
+
+      recordSelection(probeIndex, now)
+
+      verboseLog("Sticky mode probing previously rate-limited key", {
+        probeIndex: probeIndex + 1,
+        probeKey: maskKey(key),
+        totalRequestsForKey: stats.requests,
+        probeQueue: stickyProbeQueue.map(index => index + 1),
+      })
+
+      return {
+        key,
+        index: probeIndex,
+        reason: "sticky-probe",
+      }
+    }
+
     // Check if current key is usable
     const currentKey = keys[currentKeyIndex]
     const currentStats = keyStats.get(currentKey)!
@@ -183,22 +323,15 @@ export function runProxy(config: Config, settings: Settings) {
       currentKey: maskKey(currentKey),
       currentRateLimited: currentStats.rateLimited,
       currentRateLimitResetAt: currentStats.rateLimitResetAt ? new Date(currentStats.rateLimitResetAt).toISOString() : null,
+      excludedIndices: Array.from(excludedIndices, index => index + 1),
+      probeQueue: stickyProbeQueue.map(index => index + 1),
     })
-    
-    // Clear rate limit if reset time has passed
-    if (currentStats.rateLimited && currentStats.rateLimitResetAt && now > currentStats.rateLimitResetAt) {
-      currentStats.rateLimited = false
 
-      verboseLog("Cleared expired rate limit for current sticky key", {
-        keyIndex: currentKeyIndex + 1,
-        key: maskKey(currentKey),
-      })
-    }
+    clearExpiredRateLimit(currentKeyIndex, now, "Cleared expired rate limit for current sticky key")
     
     // Use current key if not rate-limited
-    if (!currentStats.rateLimited) {
-      currentStats.requests++
-      currentStats.lastUsed = now
+    if (!excludedIndices.has(currentKeyIndex) && !currentStats.rateLimited) {
+      recordSelection(currentKeyIndex, now)
 
       verboseLog("Sticky mode selected current key", {
         selectedIndex: currentKeyIndex + 1,
@@ -206,14 +339,24 @@ export function runProxy(config: Config, settings: Settings) {
         totalRequestsForKey: currentStats.requests,
       })
 
-      return currentKey
+      return {
+        key: currentKey,
+        index: currentKeyIndex,
+        reason: "sticky-current",
+      }
     }
     
     // Current key is rate-limited, find next available key
     for (let i = 1; i < keys.length; i++) {
       const candidateIndex = (currentKeyIndex + i) % keys.length
+      if (excludedIndices.has(candidateIndex)) {
+        continue
+      }
+
       const key = keys[candidateIndex]
       const stats = keyStats.get(key)!
+
+      clearExpiredRateLimit(candidateIndex, now, "Cleared expired rate limit for fallback key")
 
       verboseLog("Sticky fallback candidate", {
         keyIndex: candidateIndex + 1,
@@ -222,19 +365,9 @@ export function runProxy(config: Config, settings: Settings) {
         rateLimitResetAt: stats.rateLimitResetAt ? new Date(stats.rateLimitResetAt).toISOString() : null,
       })
       
-      if (stats.rateLimited && stats.rateLimitResetAt && now > stats.rateLimitResetAt) {
-        stats.rateLimited = false
-
-        verboseLog("Cleared expired rate limit for fallback key", {
-          keyIndex: candidateIndex + 1,
-          key: maskKey(key),
-        })
-      }
-      
       if (!stats.rateLimited) {
         currentKeyIndex = candidateIndex
-        stats.requests++
-        stats.lastUsed = now
+        recordSelection(candidateIndex, now)
         console.log(`  ↻ Switched to key #${currentKeyIndex + 1}`)
 
         verboseLog("Sticky mode switched to fallback key", {
@@ -243,87 +376,157 @@ export function runProxy(config: Config, settings: Settings) {
           totalRequestsForKey: stats.requests,
         })
 
-        return key
+        return {
+          key,
+          index: candidateIndex,
+          reason: "sticky-fallback",
+        }
       }
     }
-    
-    // All keys rate-limited
-    verboseLog("All keys are rate-limited in sticky mode; selecting earliest reset key")
-    return getKeyWithEarliestReset()
-  }
-  
-  function getKeyWithEarliestReset(): string {
-    let bestKey = keys[0]
-    let earliestReset = Infinity
-    
-    for (const [index, key] of keys.entries()) {
-      const stats = keyStats.get(key)!
 
-      verboseLog("Earliest-reset candidate", {
-        keyIndex: index + 1,
-        key: maskKey(key),
-        rateLimited: stats.rateLimited,
-        rateLimitResetAt: stats.rateLimitResetAt ? new Date(stats.rateLimitResetAt).toISOString() : null,
-      })
-
-      if (stats.rateLimitResetAt && stats.rateLimitResetAt < earliestReset) {
-        earliestReset = stats.rateLimitResetAt
-        bestKey = key
-      }
-    }
-    
-    const stats = keyStats.get(bestKey)!
-    stats.requests++
-    stats.lastUsed = Date.now()
-
-    verboseLog("Earliest-reset key selected", {
-      selectedIndex: keys.indexOf(bestKey) + 1,
-      selectedKey: maskKey(bestKey),
-      earliestResetAt: Number.isFinite(earliestReset) ? new Date(earliestReset).toISOString() : null,
-      totalRequestsForKey: stats.requests,
+    verboseLog("All keys are cooling down in sticky mode", {
+      probeQueue: stickyProbeQueue.map(index => index + 1),
     })
 
-    return bestKey
+    return null
   }
   
-  function getBestKey(): string {
+  function getBestKey(excludedIndices: Set<number>): KeySelection | null {
     verboseLog("Choosing key", {
       rotationMode: settings.rotationMode,
+      excludedIndices: Array.from(excludedIndices, index => index + 1),
     })
 
     if (settings.rotationMode === "sticky") {
-      return getKeySticky()
+      return getKeySticky(excludedIndices)
     } else {
-      return getKeyBalanced()
+      return getKeyBalanced(excludedIndices)
     }
   }
+
+  function handleRecoveredKey(selection: KeySelection, status: number) {
+    const stats = keyStats.get(selection.key)
+    if (!stats) {
+      return
+    }
+
+    const hadRateLimitState = Boolean(
+      stats.rateLimited ||
+      stats.rateLimitResetAt ||
+      stats.rateLimitCount ||
+      stickyProbeQueue.includes(selection.index)
+    )
+
+    stats.rateLimited = false
+    stats.rateLimitResetAt = undefined
+    stats.rateLimitCount = 0
+
+    removeStickyProbe(selection.index)
+
+    if (selection.reason === "sticky-probe" && currentKeyIndex !== selection.index) {
+      currentKeyIndex = selection.index
+      console.log(`  ↻ Restored sticky key #${currentKeyIndex + 1}`)
+    }
+
+    if (hadRateLimitState) {
+      console.log(`  ✓ Key ${maskKey(selection.key)} recovered`)
+
+      verboseLog("Key recovered from rate limit", {
+        keyIndex: selection.index + 1,
+        key: maskKey(selection.key),
+        status,
+        stickyProbeQueue: stickyProbeQueue.map(index => index + 1),
+      })
+    }
+  }
+
+  function getSoonestRateLimitResetMs() {
+    const now = Date.now()
+    let soonestResetMs = Infinity
+
+    for (const key of keys) {
+      const stats = keyStats.get(key)!
+      if (!stats.rateLimited || !stats.rateLimitResetAt) {
+        continue
+      }
+
+      soonestResetMs = Math.min(soonestResetMs, Math.max(stats.rateLimitResetAt - now, 0))
+    }
+
+    return Number.isFinite(soonestResetMs) ? soonestResetMs : DEFAULT_RATE_LIMIT_WAIT_MS
+  }
   
-  function handleRateLimit(key: string, retryAfter?: string) {
+  function handleRateLimit(index: number, retryAfter?: string) {
+    const key = keys[index]
     const stats = keyStats.get(key)
     if (stats) {
-      const retryAfterSeconds = retryAfter ? Number.parseInt(retryAfter, 10) : Number.NaN
-      const waitMs = Number.isFinite(retryAfterSeconds) ? retryAfterSeconds * 1000 : 60000
+      const explicitWaitMs = parseRetryAfterMs(retryAfter)
+      const previousRateLimitCount = stats.rateLimitCount || 0
+      const waitMs = explicitWaitMs ?? (
+        previousRateLimitCount === 0
+          ? 0
+          : Math.min(DEFAULT_RATE_LIMIT_WAIT_MS * 2 ** (previousRateLimitCount - 1), MAX_RATE_LIMIT_WAIT_MS)
+      )
+      const now = Date.now()
 
       stats.rateLimited = true
       stats.errors++
-      stats.rateLimitResetAt = Date.now() + waitMs
+      stats.rateLimitResetAt = now + waitMs
+      stats.rateLimitCount = previousRateLimitCount + 1
+      stats.lastRateLimitedAt = now
 
-      console.log(`  ⚠ Key ${maskKey(key)} rate limited, reset in ${Math.round(waitMs / 1000)}s`)
+      if (settings.rotationMode === "sticky") {
+        enqueueStickyProbe(index)
+      }
+
+      if (waitMs === 0) {
+        console.log(`  ⚠ Key ${maskKey(key)} rate limited, will probe it again on the next request`)
+      } else {
+        console.log(`  ⚠ Key ${maskKey(key)} rate limited, retry in ${Math.max(1, Math.ceil(waitMs / 1000))}s`)
+      }
 
       verboseLog("Rate limit recorded", {
+        keyIndex: index + 1,
         key: maskKey(key),
         retryAfterHeader: retryAfter || null,
-        retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : null,
+        retryAfterMs: explicitWaitMs,
         waitMs,
+        immediateProbe: waitMs === 0,
         rateLimitResetAt: new Date(stats.rateLimitResetAt).toISOString(),
+        rateLimitCount: stats.rateLimitCount,
+        stickyProbeQueue: stickyProbeQueue.map(queueIndex => queueIndex + 1),
         keyErrors: stats.errors,
       })
     } else {
       verboseLog("Rate limit reported for unknown key", {
+        keyIndex: index + 1,
         key: maskKey(key),
         retryAfterHeader: retryAfter || null,
       })
     }
+  }
+
+  function createUnavailableResponse(requestId: number) {
+    const waitMs = getSoonestRateLimitResetMs()
+    const retryAfterSeconds = Math.max(1, Math.ceil(waitMs / 1000))
+
+    console.log(`  ⚠ All keys are cooling down, retry in ${retryAfterSeconds}s`)
+
+    return Response.json(
+      {
+        error: "Rate limited",
+        message: "All configured keys are temporarily rate-limited",
+        requestId,
+      },
+      {
+        status: 429,
+        headers: {
+          "retry-after": String(retryAfterSeconds),
+          "x-proxy-key-index": "0",
+          "x-proxy-rotation-mode": settings.rotationMode,
+        },
+      }
+    )
   }
   
   const server = Bun.serve({
@@ -376,91 +579,115 @@ export function runProxy(config: Config, settings: Settings) {
       }
       
       const targetUrl = `${VIVGRID_BASE_URL}${url.pathname}${url.search}`
-      const apiKey = getBestKey()
-      
-      const keyIndex = keys.indexOf(apiKey) + 1
-      const keyName = config.keys[keyIndex - 1]?.name || maskKey(apiKey)
-      console.log(`  → ${req.method} ${url.pathname} [Key #${keyIndex}: ${keyName}]`)
-
-      verboseLog(`Request #${requestId} selected key`, {
-        keyIndex,
-        keyName,
-        key: maskKey(apiKey),
-        targetUrl,
-      })
-      
-      const headers = new Headers(req.headers)
-      headers.set("Authorization", `Bearer ${apiKey}`)
-      headers.set("x-api-key", apiKey)
-      headers.delete("host")
-
-      verboseLog(`Request #${requestId} forwarding upstream`, {
-        method: req.method,
-        targetUrl,
-        hasBody: req.body !== null,
-        headers: headersToObject(headers),
-      })
+      const attemptedIndices = new Set<number>()
+      let lastRateLimitedResponse: Response | null = null
+      let lastRateLimitedKeyIndex = 0
+      let lastAttemptedIndex: number | null = null
+      let lastUpstreamHeaders: Headers | null = null
       
       try {
-        const response = await fetch(targetUrl, {
-          method: req.method,
-          headers,
-          body: req.body,
-          // @ts-ignore
-          duplex: "half",
-          // Disable Bun fetch timeout so long-running requests can complete.
-          // Opencode controls provider-level timeout separately.
-          timeout: false,
-        })
+        const requestBody = req.body !== null ? await req.arrayBuffer() : undefined
 
-        const durationMs = Date.now() - requestStartedAt
+        while (attemptedIndices.size < keys.length) {
+          const selection = getBestKey(attemptedIndices)
 
-        verboseLog(`Request #${requestId} upstream response`, {
-          status: response.status,
-          statusText: response.statusText,
-          durationMs,
-          contentType: response.headers.get("content-type"),
-          contentLength: response.headers.get("content-length"),
-          headers: headersToObject(response.headers),
-        })
-        
-        if (response.status === 429) {
-          handleRateLimit(apiKey, response.headers.get("retry-after") || undefined)
+          if (!selection) {
+            break
+          }
+
+          attemptedIndices.add(selection.index)
+
+          const keyIndex = selection.index + 1
+          const keyName = config.keys[selection.index]?.name || maskKey(selection.key)
+
+          console.log(`  → ${req.method} ${url.pathname} [Key #${keyIndex}: ${keyName}]`)
+
+          verboseLog(`Request #${requestId} selected key`, {
+            keyIndex,
+            keyName,
+            key: maskKey(selection.key),
+            selectionReason: selection.reason,
+            attemptedIndices: Array.from(attemptedIndices, index => index + 1),
+            targetUrl,
+          })
+
+          const headers = new Headers(req.headers)
+          headers.set("Authorization", `Bearer ${selection.key}`)
+          headers.set("x-api-key", selection.key)
+          headers.delete("host")
+
+          lastAttemptedIndex = selection.index
+          lastUpstreamHeaders = headers
+
+          verboseLog(`Request #${requestId} forwarding upstream`, {
+            method: req.method,
+            targetUrl,
+            hasBody: req.body !== null,
+            headers: headersToObject(headers),
+          })
+
+          const response = await fetch(targetUrl, {
+            method: req.method,
+            headers,
+            body: requestBody ? requestBody.slice(0) : undefined,
+            // @ts-ignore
+            duplex: "half",
+            // Disable Bun fetch timeout so long-running requests can complete.
+            // Opencode controls provider-level timeout separately.
+            timeout: false,
+          })
+
+          const durationMs = Date.now() - requestStartedAt
+
+          verboseLog(`Request #${requestId} upstream response`, {
+            keyIndex,
+            key: maskKey(selection.key),
+            selectionReason: selection.reason,
+            status: response.status,
+            statusText: response.statusText,
+            durationMs,
+            contentType: response.headers.get("content-type"),
+            contentLength: response.headers.get("content-length"),
+            headers: headersToObject(response.headers),
+          })
+
+          if (response.status === 429) {
+            handleRateLimit(selection.index, response.headers.get("retry-after") || undefined)
+            lastRateLimitedResponse = response
+            lastRateLimitedKeyIndex = keyIndex
+
+            if (attemptedIndices.size < keys.length) {
+              console.log(`  ↻ Retrying ${req.method} ${url.pathname} with another key`)
+
+              try {
+                await response.body?.cancel()
+              } catch {
+                // Ignore body cancellation issues on retry.
+              }
+
+              continue
+            }
+          } else {
+            handleRecoveredKey(selection, response.status)
+          }
+
+          return createProxyResponse(response, requestId, keyIndex, settings.rotationMode)
         }
-        
-        const responseHeaders = new Headers(response.headers)
-        responseHeaders.set("x-proxy-key-index", String(keyIndex))
-        responseHeaders.set("x-proxy-rotation-mode", settings.rotationMode)
-        
-        // For SSE streams, buffer events to prevent mid-event chunk splits
-        // which can cause JSON parsing errors in clients
-        let responseBody = response.body
-        if (isSSEResponse(response) && responseBody) {
-          verboseLog(`Request #${requestId} response is SSE, enabling event buffer transform`)
-          responseBody = responseBody.pipeThrough(createSSEBufferTransform(requestId))
-        } else if (isSSEResponse(response)) {
-          verboseLog(`Request #${requestId} response marked as SSE but has no body`)
+
+        if (lastRateLimitedResponse) {
+          return createProxyResponse(lastRateLimitedResponse, requestId, lastRateLimitedKeyIndex, settings.rotationMode)
         }
 
-        verboseLog(`Request #${requestId} returning response`, {
-          status: response.status,
-          statusText: response.statusText,
-          proxyHeaders: {
-            "x-proxy-key-index": String(keyIndex),
-            "x-proxy-rotation-mode": settings.rotationMode,
-          },
-        })
-        
-        return new Response(responseBody, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders,
-        })
+        return createUnavailableResponse(requestId)
       } catch (error) {
         const durationMs = Date.now() - requestStartedAt
-        const stats = keyStats.get(apiKey)
-        if (stats) {
-          stats.errors++
+
+        const lastAttemptedKey = lastAttemptedIndex !== null ? keys[lastAttemptedIndex] : null
+        if (lastAttemptedKey) {
+          const stats = keyStats.get(lastAttemptedKey)
+          if (stats) {
+            stats.errors++
+          }
         }
         
         verboseError(`Request #${requestId} proxy failure`, error, {
@@ -468,12 +695,13 @@ export function runProxy(config: Config, settings: Settings) {
           pathname: url.pathname,
           search: url.search,
           targetUrl,
-          keyIndex,
-          keyName,
-          key: maskKey(apiKey),
+          attemptedKeys: Array.from(attemptedIndices, index => maskKey(keys[index])),
+          attemptedKeyIndices: Array.from(attemptedIndices, index => index + 1),
+          lastAttemptedKeyIndex: lastAttemptedIndex !== null ? lastAttemptedIndex + 1 : null,
+          lastAttemptedKey: lastAttemptedKey ? maskKey(lastAttemptedKey) : null,
           durationMs,
           requestHeaders: headersToObject(req.headers),
-          upstreamHeaders: headersToObject(headers),
+          upstreamHeaders: lastUpstreamHeaders ? headersToObject(lastUpstreamHeaders) : null,
         })
 
         return Response.json(
